@@ -19,8 +19,10 @@ from transformers import LlamaTokenizer
 
 
 from llama_recipes.model_checkpointing import save_model_checkpoint, save_model_and_optimizer_sharded, save_optimizer_checkpoint
-from llama_recipes.policies import fpSixteen,bfSixteen, get_llama_wrapper
+from llama_recipes.policies import fpSixteen,bfSixteen_mixed, get_llama_wrapper
 from llama_recipes.utils.memory_utils import MemoryTrace
+
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 
 
 def set_tokenizer_params(tokenizer: LlamaTokenizer):
@@ -31,10 +33,10 @@ def set_tokenizer_params(tokenizer: LlamaTokenizer):
 def byte2mb(x):
     return int(x / 2**20)
 
-def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None):
+def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, run=None):
     """
     Trains the model on the given dataloader
-
+    
     Args:
         model: The model to be trained
         train_dataloader: The dataloader containing the training data
@@ -66,6 +68,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     checkpoint_times = []
     results = {}
     best_val_loss = float("inf")
+    eval_epoch_loss = float("-inf")
+    
+        
     for epoch in range(train_config.num_epochs):
         epoch_start_time = time.perf_counter()
         with MemoryTrace() as memtrace:  # track the memory usage
@@ -100,6 +105,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         pbar.update(1)
 
                 pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
+                if run:
+                    run.log({ 'train_loss': loss.detach().float() })
             pbar.close()
 
         epoch_end_time = time.perf_counter()-epoch_start_time
@@ -133,39 +140,45 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         lr_scheduler.step()
 
         if train_config.run_validation:
-            eval_ppl, eval_epoch_loss = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer)
-            checkpoint_start_time = time.perf_counter()
-            if train_config.save_model and eval_epoch_loss < best_val_loss:
-                if train_config.enable_fsdp:
-                    dist.barrier()
-                if train_config.use_peft:
-                    if train_config.enable_fsdp:
-                        if rank==0:
-                            print(f"we are about to save the PEFT modules")
-                    else:
-                        print(f"we are about to save the PEFT modules")
-                    model.save_pretrained(train_config.output_dir)
-                    if train_config.enable_fsdp:
-                        if rank==0:
-                            print(f"PEFT modules are saved in {train_config.output_dir} directory")
-                    else:
-                        print(f"PEFT modules are saved in {train_config.output_dir} directory")
+            eval_ppl, eval_epoch_loss = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, run)
 
+        checkpoint_start_time = time.perf_counter()
+        if train_config.save_model and eval_epoch_loss < best_val_loss:
+            if train_config.enable_fsdp:
+                dist.barrier()
+            if train_config.use_peft:
+
+                if not train_config.enable_fsdp or rank == 0:
+                    print(f"we are about to save the PEFT modules")
+                
+                save_dir = f'{train_config.output_dir}/epoch_{epoch+1}'
+                if train_config.enable_fsdp and train_config.fsdp_peft_cpu_offload_for_save:
+                    print(f"we are about to offload to CPU to save")
+                    full_state_dict_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
+                    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+                        model.save_pretrained(save_dir)
+                    
                 else:
-                    if not train_config.use_peft and fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
+                    model.save_pretrained(save_dir)
 
-                        save_model_checkpoint(
-                            model, optimizer, rank, train_config, epoch=epoch
-                        )
-                    elif not train_config.use_peft and fsdp_config.checkpoint_type == StateDictType.SHARDED_STATE_DICT:
-                        print(" Saving the FSDP model checkpoints using SHARDED_STATE_DICT")
+                if not train_config.enable_fsdp or rank == 0:
+                    print(f"PEFT modules are saved in {save_dir} directory")             
+                    
+            else:
+                if not train_config.use_peft and fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
+                    
+                    save_model_checkpoint(
+                        model, optimizer, rank, train_config, epoch=epoch
+                    )
+                elif not train_config.use_peft and fsdp_config.checkpoint_type == StateDictType.SHARDED_STATE_DICT:
+                    print(" Saving the FSDP model checkpoints using SHARDED_STATE_DICT")
+                    print("=====================================================")
+                    
+                    save_model_and_optimizer_sharded(model, rank, train_config)
+                    if train_config.save_optimizer:
+                        save_model_and_optimizer_sharded(model, rank, train_config, optim=optimizer)
+                        print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
                         print("=====================================================")
-
-                        save_model_and_optimizer_sharded(model, rank, train_config)
-                        if train_config.save_optimizer:
-                            save_model_and_optimizer_sharded(model, rank, train_config, optim=optimizer)
-                            print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
-                            print("=====================================================")
 
                     if not train_config.use_peft and  train_config.save_optimizer:
                         save_optimizer_checkpoint(
@@ -184,13 +197,34 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
                 else:
                     print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
+                if not train_config.use_peft and  train_config.save_optimizer:
+                    save_optimizer_checkpoint(
+                        model, optimizer, rank, train_config, epoch=epoch
+                    )
+                    print(" Saving the FSDP model checkpoints and optimizer using FULL_STATE_DICT")
+                    print("=====================================================")                     
+            if train_config.enable_fsdp:
+                dist.barrier()
+        checkpoint_end_time = time.perf_counter() - checkpoint_start_time
+        checkpoint_times.append(checkpoint_end_time)
+        if train_config.run_validation and eval_epoch_loss < best_val_loss:
+            best_val_loss = eval_epoch_loss
+            if train_config.enable_fsdp:
+                if rank==0:
+                    print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
+            else:
+                print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
+        if train_config.run_validation:
             val_loss.append(best_val_loss)
             val_prep.append(eval_ppl)
+        
+                
         if train_config.enable_fsdp:
             if rank==0:
                 print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
         else:
             print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
+            
     avg_epoch_time = sum(epoch_times)/ len(epoch_times)
     avg_checkpoint_time = sum(checkpoint_times)/ len(checkpoint_times) if len(checkpoint_times) > 0 else 0
     avg_train_prep = sum(train_prep)/len(train_prep)
@@ -213,7 +247,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
     return results
 
-def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer):
+def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, run=None):
     """
     Evaluates the model on the given dataloader
 
@@ -242,13 +276,17 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer):
                 # Forward pass and compute loss
                 outputs = model(**batch)
                 loss = outputs.loss
-                eval_loss += loss.detach().float()
+                loss_float = loss.detach().float()
+                # Check if nan, nan value wont be equal to itself
+                eval_loss += (0 if loss_float != loss_float else loss_float)
+                if run:
+                    run.log({'eval_loss': loss_float })
+                    
             # Decode predictions and add to evaluation predictions list
             preds = torch.argmax(outputs.logits, -1)
             eval_preds.extend(
                 tokenizer.batch_decode(preds.detach().cpu().numpy(), skip_special_tokens=True)
             )
-
     # If there's more than one CUDA device, reduce evaluation loss across all devices
     if torch.cuda.device_count() > 1 and train_config.enable_fsdp:
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
@@ -356,7 +394,7 @@ def get_policies(cfg, rank):
         bf16_ready = verify_bfloat_support
 
         if bf16_ready and not cfg.use_fp16:
-            mixed_precision_policy = bfSixteen
+            mixed_precision_policy = bfSixteen_mixed
             if rank == 0:
                 print(f"bFloat16 enabled for mixed precision - using bfSixteen policy")
         elif cfg.use_fp16:
