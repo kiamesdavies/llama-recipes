@@ -5,7 +5,7 @@ B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
 
 
 def get_custom_dataset(dataset_config, tokenizer, split):
-    dataset = datasets.load_dataset("kiamesdavies/alchemist_supecharged-v2",
+    dataset = datasets.load_dataset("kiamesdavies/alchemist_supecharged_v3",
                                     split="train" if split == dataset_config.train_split else "test")
 
     prompt_template = (
