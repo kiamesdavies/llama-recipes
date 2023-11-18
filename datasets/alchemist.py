@@ -5,19 +5,19 @@ B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
 
 
 def get_custom_dataset(dataset_config, tokenizer, split):
-    dataset = datasets.load_dataset("kiamesdavies/prometheus-grafana-dashboards-full-v3",
+    dataset = datasets.load_dataset("kiamesdavies/alchemist",
                                     split="train" if split == dataset_config.train_split else "test")
 
     prompt_template = (
-        f"{B_INST} {B_SYS}Using the supplied Grafana dashboard graphs/panels in JSON – encompassing title, type, description, and associated metrics – and optionally the header of its associated group and a general dashboard summary, generate valid PromQL query.{E_SYS}```json\n{{alchemist_input}}\n```\n{E_INST}\n"
+        f"{B_INST} {B_SYS}Given a collection of Prometheus metrics, and its labels, generate valid PromQL, and categorize them into different graphs{E_SYS}```json\n{{input}}\n```\n{E_INST}\n"
     )
 
-    output_template = f"[RESULT]```json\n{{alchemist_output}}\n```[/RESULT]"
+    output_template = f"[RESULT]```json\n{{output}}\n```[/RESULT]"
 
     def apply_prompt_template(sample):
         return {
-            "prompt": prompt_template.format(**sample),
-            "output": output_template.format(**sample),
+            "prompt": prompt_template.format_map(sample),
+            "output": output_template.format_map(sample),
         }
 
     dataset = dataset.map(apply_prompt_template,
